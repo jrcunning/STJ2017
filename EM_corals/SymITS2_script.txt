@@ -1,0 +1,41 @@
+
+
+
+# GET DATA: Copy ITS2 sequencing fastq files for samples from Erinn Muller with associated 16S data
+
+# Samples from Hurricane Hole (OC=Otter Creek, WC=Water Creek)
+cp -r ../all_fastq/R.Cunning_2-2-18-71086015/FASTQ_Generation_2018-03-28_22_46_06Z-87942220/OC* data/fastq/
+cp -r ../all_fastq/R.Cunning_2-2-18-71086015/FASTQ_Generation_2018-03-28_22_46_06Z-87942220/WC* data/fastq/
+# Samples from other reef locations (LT=Lime Tree, CB=Coral Bay, H=Haulover)
+cp -r ../all_fastq/R.Cunning_2-2-18-71086015/FASTQ_Generation_2018-03-28_22_46_06Z-87942220/LT* data/fastq/
+cp -r ../all_fastq/R.Cunning_2-2-18-71086015/FASTQ_Generation_2018-03-28_22_46_06Z-87942220/CB* data/fastq/
+cp -r ../all_fastq/R.Cunning_2-2-18-71086015/FASTQ_Generation_2018-03-28_22_46_06Z-87942220/H* data/fastq/
+# Move all fastq.gz files into a single directory
+mv data/fastq/*/*.fastq.gz data/fastq/
+# Delete empty folders
+find data/fastq ! -name '*.fastq.gz' -delete
+# Uncompress all .fastq.gz files
+find data/fastq -name '*.gz' -exec gunzip '{}' \;
+# Rename fastq files to remove hyphens
+for file in *.fastq; do
+    mv "$file" "${file/\-/}"
+done
+
+# MERGE READS
+bash ~/SymITS2/merge_reads.sh
+
+# QC/TRIM READS
+bash ~/SymITS2/qc_trim_reads.sh
+
+# CLUSTER WITHIN SAMPLES
+bash ~/SymITS2/otus_97_bysample.sh data/fasta/combined_seqs_trimmed.fasta data/clust
+
+# ASSIGN TAXONOMY TO REP SET SEQUENCES
+R --vanilla < ~/SymITS2/run_nw.R --args data/clust/all_rep_set_rep_set.fasta data/ITS2db_trimmed_derep.fasta
+
+# BUILD PHYLOSEQ
+R --vanilla < ~/SymITS2/build_phyloseq.R --args data/clust/all_rep_set_rep_set_nw_tophits.tsv data/mapping_file.txt data/clust/97_otus_bysample.tsv data/ITS2db_trimmed_notuniques_otus.txt data/phy.RData
+
+# FILTER OUT NON-SYMBIODINIUM SEQUENCES
+R --vanilla < ~/SymITS2/filter_notsym.R --args data/phy.RData data/clust/all_rep_set_rep_set.fasta data/phy.f.RData $NT_PATH
+

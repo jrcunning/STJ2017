@@ -1,0 +1,298 @@
+---
+title: "Bacterial communities associated with distinct coral-*Symbiodinium* holobionts in St. John, U.S. Virgin Islands"
+author: "Ross Cunning"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document: 
+    toc: yes
+    toc_depth: 3
+    toc_float:
+      collapsed: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = TRUE)
+options(scipen = 3, digits = 9)
+```
+
+```{r setup_2, include=FALSE}
+# Load custom R functions
+source("R/functions.R", .GlobalEnv)
+# Load package libraries
+library(phyloseq); library(vegan); library(multcompView); library(reshape2); library(igraph); library(stringr); library(tidyverse); library(cowplot); library(readxl)
+# Set colors for plotting clades
+taxcolors <- matrix(c("#8dd3c7", "#ffffb3", "#bebada", "#fb8072", "#80b1d3", "#fdb462"), 
+                    dimnames=list(c("CladeA", "CladeB", "CladeC", "CladeD", "CladeF", "CladeG")))
+```
+
+# Import data
+
+### Load *Symbiodinium* data
+```{r}
+load("data/phy.f.p.RData")
+sym <- phy.f.p
+
+# Remove samples that were run twice and rename
+sym <- subset_samples(sym, sample_names(sym) != "LT071A")
+sym <- subset_samples(sym, sample_names(sym) != "OC084A")
+sample_names(sym)[sample_names(sym) == "LT071B"] <- "LT071"
+sample_names(sym)[sample_names(sym) == "OC084B"] <- "OC084"
+
+# Change order of samples in phyloseq, because distance matrix depends on this
+samplenames <- sort(sample_names(sym))
+sym_samdat <- sample_data(sym) %>%
+  arrange(InputFileName) %>%
+  mutate(sample = samplenames) %>%
+  column_to_rownames("sample") %>%
+  data.frame() %>%
+  sample_data()
+sym_otutab <- as.matrix(otu_table(sym))[, samplenames]
+sym_taxtab <- tax_table(sym)
+
+sym2 <- phyloseq(sym_samdat, sym_otutab, sym_taxtab)
+
+# Assign dominant symbiont clade to sample data
+domclade <- sym2 %>%
+  tax_glom(taxrank = "Clade") %>%                # agglomerate at clade level
+  psmelt() %>%                                   # Melt to long format
+  select(Sample, Abundance, Site, Species, Subtype2, Clade) %>%
+  group_by(Sample) %>%
+  filter(Abundance == max(Abundance)) %>%
+  arrange(Sample)
+
+sample_data(sym2)$domclade <- domclade$Clade
+```
+
+### Load bacteria data
+```{r}
+bact_data <- read_csv("data/STJ_OTUdata_cleaned_V_added.csv") %>%
+  select(-1, -matches("W1$|W2$|W3$"), -matches("Summary")) %>%      # Remove water samples and Summary
+  rename(D.labrinthiformis.OC.089 = D.labrinthiformis,              # Add missing sample name
+         D.labrinthiformis.OC.136 = D.labrinthiformis.OC.084)       # Change incorrect sample name    
+bact_data[1, 47] <- "dlab"                                          # Add missing species value
+bact_data[3, 47] <- "OC"                                            # Add missing site name
+  
+# Parse sample data
+bact_samdat <- bact_data %>%
+  filter(between(row_number(), 1, 3)) %>%
+  select(-(2:7)) %>%
+  gather(sample, val, 2:ncol(.)) %>%
+  spread(names(.)[1], val) %>%
+  separate(sample, sep="\\.", into = c("G", "sp", "site", "id")) %>%
+  unite(site, id, col="Sample", sep = "") %>%
+  select(Sample, Location, Species, Type) %>%
+  arrange(Sample) %>%
+  mutate(HH = case_when(Location %in% c("CB", "H", "LT") ~ "outHH",
+                        Location %in% c("OC", "WC") ~ "inHH")) %>%
+  data.frame(., row.names = .$Sample)
+
+# Parse OTU table
+bact_otutab <- bact_data %>%
+  filter(row_number() > 3) %>%
+  select(1, 8:ncol(.)) %>%
+  type_convert() %>%
+  column_to_rownames("OTU_Name_1") %>%
+  data.frame()
+colnames(bact_otutab) <- rownames(bact_samdat)
+
+# Parse taxonomy table
+bact_taxtab <- bact_data %>%
+  filter(row_number() > 3) %>%
+  select(1:7) %>%
+  mutate(tax = map(`16rRNA`, parse_taxonomy_qiime),
+         tax2= map(tax, bind_rows)) %>%
+  unnest(tax2) %>%
+  select(1, 10:15, 9, 3:5) %>%
+  column_to_rownames("OTU_Name_1") %>%
+  data.frame()
+  
+# Create phyloseq object
+bsd <- sample_data(data.frame(bact_samdat, row.names=bact_samdat$Sample))
+bot <- otu_table(bact_otutab, taxa_are_rows = TRUE)
+btt <- tax_table(as.matrix(bact_taxtab))
+bac <- phyloseq(bsd, bot, btt)
+
+# Subset bacteria data for samples for which we have Symbiodinium data
+bac <- subset_samples(bac, sample_names(bac) %in% sample_names(sym2))
+# Add dominant Symbiodinium clade to sample data
+sample_data(bac)$domclade <- domclade$Clade
+
+# Filter low abundance taxa
+bac <- filter_taxa(bac, function(x) max(x) >=3 , TRUE)  # Only keep if observed >= 3x in 1 sample
+
+# Rarefy OTU table
+set.seed(1234)
+bac <- rarefy_even_depth(bac)
+
+# Transform to relative abundance
+bac.p <- transform_sample_counts(bac, function(x) x/sum(x))
+bac.t <- transform_sample_counts(bac, function(x) sqrt(x/sum(x)))
+
+
+```
+
+----------
+
+# *Diploria labyrinthiformis*
+```{r dlab}
+# Subset D. labyrinthiformis data
+dlab.sym <- subset_samples(sym2, Species == "Dlab")
+dlab.bac <- subset_samples(bac.p, Species == "dlab")        # Use proportion data
+dlab.bac <- prune_taxa(taxa_sums(dlab.bac) != 0, dlab.bac)  # Prune taxa not present in subset
+dlab.bac <- subset_samples(dlab.bac, sample_names(dlab.bac) %in% sample_names(dlab.sym))
+```
+
+### Bacterial community structure
+```{r dlab_barplots, fig.width = 10, fig.height = 4}
+# Glom OTUs to Phylum
+dlab.bac.phylum <- tax_glom(dlab.bac, taxrank = "Phylum")
+
+# Plot bacterial communities by location
+plot_bar(physeq = dlab.bac.phylum, fill = "Phylum", title = "D. labyrinthiformis") +
+  facet_grid(~ Location, scales = "free_x") +
+  theme(axis.text.x = element_text(vjust = 0.5))
+
+# Plot bacterial communities by dominant Symbiodinium clade
+plot_bar(physeq = dlab.bac.phylum, fill = "Phylum", title = "D. labyrinthiformis") +
+  facet_grid(~ domclade, scales = "free_x") +
+  theme(axis.text.x = element_text(vjust = 0.5))
+```
+
+### Ordination analysis (NMDS)
+```{r dlab_nmds, fig.height = 3, fig.width = 4}
+# Calculate Bray-Curtis dissimilarity matrix
+dlab.nmds <- ordinate(dlab.bac, method = "NMDS", distance = "bray", trace = FALSE)
+# Plot ordination visualizing differences among all sites
+plot_ordination(dlab.bac, dlab.nmds, type = "samples", shape = "domclade", color = "Location")
+# Plot ordination visualizing differences in Hurricane Hole
+plot_ordination(dlab.bac, dlab.nmds, type = "samples", shape = "domclade", color = "HH")
+```
+
+### Influence of location and *Symbiodinium* (PERMANOVA)
+Are location and dominant *Symbiodinium* clade significant predictors of bacterial community structure?
+```{r dlab_permanova}
+# Test all locations
+dlab.perm <- vegan::adonis(distance(dlab.bac, "bray") ~ Location * domclade, 
+                           data=as(sample_data(dlab.bac), "data.frame"), 
+                           permutations=9999)
+dlab.perm  
+```
+There is a strong effect of location, but no effect of dominant symbiont clade.
+
+### Bacteria and *Symbiodinium* correlation (Mantel)
+```{r dlab_mantel}
+# Compare Bray-Curtis dissimilarities for bacteria and Symbiodinium
+dlab.sym.dist <- phyloseq::distance(dlab.sym, "bray")
+dlab.bac.dist <- phyloseq::distance(dlab.bac, "bray")
+ecodist::mantel(dlab.bac.dist ~ dlab.sym.dist)
+```
+No statistical evidence that these communities are correlated in *D. labyrinthiformis*.
+
+----------
+
+# *Orbicella annularis*
+```{r oann}
+# Subset D. labyrinthiformis data
+oann.sym <- subset_samples(sym2, Species == "Oann")
+oann.bac <- subset_samples(bac.p, Species == "oann")  # Use proportion data
+oann.bac <- subset_samples(oann.bac, sample_names(oann.bac) %in% sample_names(oann.sym))
+```
+
+### Bacterial community structure
+```{r oann_barplots, fig.width = 10, fig.height = 4}
+# Glom OTUs to Phylum
+oann.bac.phylum <- tax_glom(oann.bac, taxrank = "Phylum")
+
+# Plot bacterial communities by location
+plot_bar(physeq = oann.bac.phylum, fill = "Phylum", title = "O. annularis") +
+  facet_grid(~ Location, scales = "free_x") +
+  theme(axis.text.x = element_text(vjust = 0.5))
+
+# Plot bacterial communities by dominant Symbiodinium clade
+plot_bar(physeq = oann.bac.phylum, fill = "Phylum", title = "O. annularis") +
+  facet_grid(~ domclade, scales = "free_x") +
+  theme(axis.text.x = element_text(vjust = 0.5))
+```
+
+### Ordination analysis (NMDS)
+```{r oann_nmds, fig.height = 3, fig.width = 4}
+# Calculate Bray-Curtis dissimilarity matrix
+oann.nmds <- ordinate(oann.bac, method = "NMDS", distance = "bray", trace = FALSE)
+# Plot ordination visualizing differences among all sites
+plot_ordination(oann.bac, oann.nmds, type = "samples", shape = "domclade", color = "Location")
+# Plot ordination visualizing differences in Hurricane Hole
+plot_ordination(oann.bac, oann.nmds, type = "samples", shape = "domclade", color = "HH")
+```
+
+### Influence of location and *Symbiodinium* (PERMANOVA)
+Are location and dominant *Symbiodinium* clade significant predictors of bacterial community structure?
+```{r oann_permanova}
+oann.perm <- vegan::adonis(distance(oann.bac, "bray") ~ Location * domclade, 
+                           data=as(sample_data(oann.bac), "data.frame"), 
+                           permutations=9999)
+oann.perm  
+```
+There is a strong effect of location, but no effect of dominant symbiont clade.
+
+### Bacteria and *Symbiodinium* correlation (Mantel)
+```{r oann_mantel}
+oann.sym.dist <- phyloseq::distance(oann.sym, "bray")
+oann.bac.dist <- phyloseq::distance(oann.bac, "bray")
+ecodist::mantel(oann.bac.dist ~ oann.sym.dist)
+```
+Highly significant correlation between bacterial and *Symbiodinium* community dissimilarity matrices in *O. annularis*. This means that corals with more similar *Symbiodinium* communities also have more similar bacterial communities, i.e., these communities covary in some way. This could be due to an effect of *Symbiodinium* in determining bacterial community composition (or vice versa), or, an effect of location driving changes in both communities.
+
+----------
+
+# *Colpophyllia natans*
+```{r cnat}
+# Subset D. labyrinthiformis data
+cnat.sym <- subset_samples(sym2, Species == "Cnat")
+cnat.bac <- subset_samples(bac.p, Species == "cnat")  # Use proportion data
+cnat.bac <- subset_samples(cnat.bac, sample_names(cnat.bac) %in% sample_names(cnat.sym))
+```
+
+### Bacterial community structure
+```{r cnat_barplots, fig.width = 10, fig.height = 4}
+# Glom OTUs to Phylum
+cnat.bac.phylum <- tax_glom(cnat.bac, taxrank = "Phylum")
+
+# Plot bacterial communities by location
+plot_bar(physeq = cnat.bac.phylum, fill = "Phylum", title = "C. natans") +
+  facet_grid(~ Location, scales = "free_x") +
+  theme(axis.text.x = element_text(vjust = 0.5))
+
+# Plot bacterial communities by dominant Symbiodinium clade
+plot_bar(physeq = cnat.bac.phylum, fill = "Phylum", title = "C. natans") +
+  facet_grid(~ domclade, scales = "free_x") +
+  theme(axis.text.x = element_text(vjust = 0.5))
+```
+
+### Visualize differences among samples (NMDS)
+```{r cnat_nmds, fig.height = 3, fig.width = 4}
+# Calculate Bray-Curtis dissimilarity matrix
+cnat.nmds <- ordinate(cnat.bac, method = "NMDS", distance = "bray", trace = FALSE)
+# Plot ordination visualizing differences among all sites
+plot_ordination(cnat.bac, cnat.nmds, type = "samples", shape = "domclade", color = "Location")
+# Plot ordination visualizing differences in Hurricane Hole
+plot_ordination(cnat.bac, cnat.nmds, type = "samples", shape = "domclade", color = "HH")
+```
+
+### Influence of location and *Symbiodinium* (PERMANOVA)
+Are location and dominant *Symbiodinium* clade significant predictors of bacterial community structure?
+```{r cnat_permanova}
+cnat.perm <- vegan::adonis(distance(cnat.bac, "bray") ~ Location * domclade, 
+                           data=as(sample_data(cnat.bac), "data.frame"), 
+                           permutations=9999)
+cnat.perm  
+```
+There is a strong effect of location, but no effect of dominant symbiont clade.
+
+### Bacteria and *Symbiodinium* correlation (Mantel)
+```{r cnat_mantel}
+cnat.sym.dist <- phyloseq::distance(cnat.sym, "bray")
+cnat.bac.dist <- phyloseq::distance(cnat.bac, "bray")
+ecodist::mantel(cnat.bac.dist ~ cnat.sym.dist)
+```
+No statistical evidence that these communities are correlated in *C. natans*.
